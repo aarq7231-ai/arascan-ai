@@ -1,0 +1,751 @@
+"""
+app.py - Website Security Scanner | فاحص أمان المواقع
+واجهة ويب ثنائية اللغة (العربية / English) بـ Streamlit، مناسبة للجوال.
+
+Run:
+    pip install -r requirements.txt
+    streamlit run app.py
+
+Scan only sites you own or have written permission to test.
+افحص فقط المواقع التي تملكها أو لديك إذن كتابي بفحصها.
+"""
+import functools
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from html import escape
+from urllib.parse import urljoin, urlparse
+
+import requests
+import streamlit as st
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ------------------------------------------------------------------ Settings
+TIMEOUT = 8
+MAX_REDIRECTS = 5
+MAX_BODY = 500_000
+COOLDOWN_SECONDS = 8
+# حدود الاستخدام (تُعدَّل من متغيرات البيئة عند النشر)
+PER_CLIENT_LIMIT = int(os.environ.get("SCAN_LIMIT_PER_CLIENT", 10))   # فحوصات/ساعة لكل مستخدم
+PER_HOST_LIMIT = int(os.environ.get("SCAN_LIMIT_PER_HOST", 5))        # فحوصات/ساعة لكل موقع مستهدف
+GLOBAL_LIMIT = int(os.environ.get("SCAN_LIMIT_GLOBAL", 200))          # فحوصات/ساعة للخدمة كلها
+LIMIT_WINDOW = 3600
+ALLOWED_PORTS = {None, 80, 443}
+UA = {"User-Agent": "SiteScanner/3.0 (authorized security check)"}
+
+LANGS = {"العربية": "ar", "English": "en"}
+ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
+WEIGHT = {"high": 20, "medium": 8, "low": 3, "info": 0}
+COLOR = {"high": "#C93B3B", "medium": "#D98A12", "low": "#A08C00", "info": "#2F6FDB"}
+TINT = {"high": "#FBE9E9", "medium": "#FCF0DC", "low": "#F7F3D4", "info": "#E5EEFB"}
+GREEN, GREEN_TINT = "#1E8E5A", "#E3F3EA"
+
+
+class BlockedError(Exception):
+    """Address not allowed. args[0] is a code: 'private' or 'port'."""
+
+
+class Report:
+    """Collects findings (negatives) and passed checks (positives) as ids + params."""
+
+    def __init__(self):
+        self.findings = []
+        self.passed = []
+
+    def add(self, sev, mid, **p):
+        self.findings.append({"severity": sev, "id": mid, "p": p})
+
+    def ok(self, mid, **p):
+        self.passed.append({"id": mid, "p": p})
+
+
+# ------------------------------------------------------------------ Messages (title, detail, fix)
+MSG = {
+    # ---- findings
+    "ssl_verify_failed": {
+        "ar": ("فشل التحقق من شهادة SSL", "{raw}", "أصلح الشهادة أو جدّدها."),
+        "en": ("SSL certificate verification failed", "{raw}", "Fix or renew the certificate."),
+    },
+    "tls_invalid": {
+        "ar": ("شهادة SSL غير صالحة", "{raw}", "ثبّت شهادة صحيحة (مثل Let's Encrypt)."),
+        "en": ("Invalid SSL certificate", "{raw}", "Install a valid certificate (e.g. Let's Encrypt)."),
+    },
+    "tls_check_failed": {
+        "ar": ("تعذّر فحص TLS على المنفذ 443", "{raw}", ""),
+        "en": ("Could not check TLS on port 443", "{raw}", ""),
+    },
+    "cert_expired": {
+        "ar": ("شهادة SSL منتهية", "انتهت منذ {days} يوم", "جدّد الشهادة فوراً."),
+        "en": ("SSL certificate expired", "Expired {days} days ago", "Renew the certificate immediately."),
+    },
+    "cert_expiring": {
+        "ar": ("شهادة SSL توشك على الانتهاء", "متبقي {days} يوم", "فعّل التجديد التلقائي."),
+        "en": ("SSL certificate is about to expire", "{days} days left", "Enable automatic renewal."),
+    },
+    "tls_old": {
+        "ar": ("إصدار TLS قديم", "{raw}", "فعّل TLS 1.2 أو 1.3 فقط."),
+        "en": ("Outdated TLS version", "{raw}", "Allow only TLS 1.2 or 1.3."),
+    },
+    "no_https_redirect": {
+        "ar": ("الموقع يعمل عبر HTTP دون تحويل إلى HTTPS", "{raw}", "أضف تحويلاً دائماً (301) من HTTP إلى HTTPS."),
+        "en": ("Site serves HTTP without redirecting to HTTPS", "{raw}",
+               "Add a permanent (301) redirect from HTTP to HTTPS."),
+    },
+    "hdr_missing_hsts": {
+        "ar": ("ترويسة أمان مفقودة: Strict-Transport-Security", "", "يمنع تخفيض الاتصال إلى HTTP. أضف HSTS."),
+        "en": ("Missing security header: Strict-Transport-Security", "",
+               "Prevents downgrade to HTTP. Add HSTS."),
+    },
+    "hdr_missing_csp": {
+        "ar": ("ترويسة أمان مفقودة: Content-Security-Policy", "", "يحدّ من هجمات XSS وحقن السكربتات."),
+        "en": ("Missing security header: Content-Security-Policy", "",
+               "Limits XSS and script-injection attacks."),
+    },
+    "hdr_missing_xcto": {
+        "ar": ("ترويسة أمان مفقودة: X-Content-Type-Options", "", "أضف القيمة: nosniff"),
+        "en": ("Missing security header: X-Content-Type-Options", "", "Add the value: nosniff"),
+    },
+    "hdr_missing_refpol": {
+        "ar": ("ترويسة أمان مفقودة: Referrer-Policy", "", "مثال: strict-origin-when-cross-origin"),
+        "en": ("Missing security header: Referrer-Policy", "", "Example: strict-origin-when-cross-origin"),
+    },
+    "hdr_missing_perm": {
+        "ar": ("ترويسة أمان مفقودة: Permissions-Policy", "", "قيّد صلاحيات الكاميرا والموقع وغيرها."),
+        "en": ("Missing security header: Permissions-Policy", "",
+               "Restrict camera, location and other browser permissions."),
+    },
+    "no_clickjack": {
+        "ar": ("لا حماية من Clickjacking", "X-Frame-Options / frame-ancestors غير موجودة",
+               "أضف X-Frame-Options: DENY"),
+        "en": ("No Clickjacking protection", "X-Frame-Options / frame-ancestors not found",
+               "Add X-Frame-Options: DENY"),
+    },
+    "version_leak": {
+        "ar": ("كشف إصدار التقنية عبر {name}", "{raw}", "أخفِ رقم الإصدار من إعدادات الخادم."),
+        "en": ("Technology version disclosed via {name}", "{raw}", "Hide the version number in the server settings."),
+    },
+    "cookie_flags": {
+        "ar": ("كوكي '{name}' ينقصه: {missing}", "", "أضف الخصائص المفقودة للكوكيز الحساسة."),
+        "en": ("Cookie '{name}' is missing: {missing}", "", "Add the missing flags to sensitive cookies."),
+    },
+    "cors_reflect": {
+        "ar": ("CORS يعكس أي Origin مع السماح بالـ Credentials", "{raw}",
+               "استخدم قائمة بيضاء صريحة للنطاقات المسموحة."),
+        "en": ("CORS reflects any Origin while allowing credentials", "{raw}",
+               "Use an explicit allow-list of trusted origins."),
+    },
+    "cors_wild": {
+        "ar": ("CORS مفتوح للجميع (*)", "", "قيّده إن كان الـ API يحمل بيانات حساسة."),
+        "en": ("CORS is open to everyone (*)", "", "Restrict it if the API carries sensitive data."),
+    },
+    "mixed": {
+        "ar": ("محتوى مختلط (Mixed Content)", "موارد تُحمَّل عبر HTTP داخل صفحة HTTPS", "حوّل كل الروابط إلى HTTPS."),
+        "en": ("Mixed content", "Resources load over HTTP inside an HTTPS page", "Switch all links to HTTPS."),
+    },
+    "pw_http": {
+        "ar": ("نموذج كلمة مرور عبر اتصال غير مشفّر", "", "فعّل HTTPS على كامل الموقع."),
+        "en": ("Password form over an unencrypted connection", "", "Enable HTTPS on the whole site."),
+    },
+    "sensitive_file": {
+        "ar": ("ملف حساس متاح للعامة: {path}", "{url}", "امنع الوصول إليه من إعدادات الخادم."),
+        "en": ("Sensitive file publicly accessible: {path}", "{url}", "Block access to it in the server settings."),
+    },
+    # ---- passed checks
+    "ok_cert": {
+        "ar": ("شهادة SSL صالحة وسارية", "متبقي {days} يوم", ""),
+        "en": ("SSL certificate is valid", "{days} days left", ""),
+    },
+    "ok_tls": {
+        "ar": ("إصدار TLS حديث", "{raw}", ""),
+        "en": ("Modern TLS version", "{raw}", ""),
+    },
+    "ok_redirect": {
+        "ar": ("التحويل من HTTP إلى HTTPS يعمل", "", ""),
+        "en": ("HTTP to HTTPS redirect works", "", ""),
+    },
+    "ok_headers": {
+        "ar": ("ترويسات الأمان الموجودة ({n} من {total})", "{raw}", ""),
+        "en": ("Security headers present ({n} of {total})", "{raw}", ""),
+    },
+    "ok_clickjack": {
+        "ar": ("حماية من Clickjacking مفعّلة", "", ""),
+        "en": ("Clickjacking protection is enabled", "", ""),
+    },
+    "ok_noleak": {
+        "ar": ("لا يكشف إصدارات الخادم في الترويسات", "", ""),
+        "en": ("Server versions are not disclosed in headers", "", ""),
+    },
+    "ok_cookies": {
+        "ar": ("الكوكيز محمية", "{n} كوكي بخصائص Secure وHttpOnly وSameSite", ""),
+        "en": ("Cookies are protected", "{n} cookie(s) with Secure, HttpOnly and SameSite", ""),
+    },
+    "ok_cors": {
+        "ar": ("إعدادات CORS لا تسمح بأي نطاق خارجي", "", ""),
+        "en": ("CORS settings don't allow arbitrary origins", "", ""),
+    },
+    "ok_mixed": {
+        "ar": ("لا يوجد محتوى مختلط في الصفحة الرئيسية", "", ""),
+        "en": ("No mixed content on the main page", "", ""),
+    },
+    "ok_files": {
+        "ar": ("لا ملفات حساسة مكشوفة", "فُحصت مسارات شائعة مثل .git و .env و phpinfo", ""),
+        "en": ("No exposed sensitive files", "Common paths checked, such as .git, .env and phpinfo", ""),
+    },
+}
+
+def summary_ar(n, m):
+    """n = عدد الملاحظات، m = عدد الفحوصات السليمة."""
+    if n == 0:
+        return f"لا ملاحظات · {m} فحص سليم"
+    return f"{n} ملاحظة · {m} فحص سليم"
+
+
+def summary_en(n, m):
+    """n = number of findings, m = number of passed checks."""
+    if n == 0:
+        return f"No findings · {m} passed"
+    word = "finding" if n == 1 else "findings"
+    return f"{n} {word} · {m} passed"
+
+
+# ------------------------------------------------------------------ UI text
+UI = {
+    "ar": {
+        "dir": "rtl", "end": "right",
+        "title": "فاحص أمان المواقع",
+        "subtitle": "ألصق رابط موقعك واحصل على تقرير بالثغرات والنقاط الآمنة خلال ثوانٍ.",
+        "url_label": "رابط الموقع",
+        "consent": "أملك هذا الموقع أو لدي إذن كتابي بفحصه",
+        "scan": "فحص الموقع",
+        "spinner": "جارٍ الفحص…",
+        "cooldown": "انتظر بضع ثوانٍ قبل الفحص التالي.",
+        "unreachable": "تعذّر الوصول إلى الموقع. تأكد من الرابط وحاول مجدداً. ({err})",
+        "err_empty": "اكتب رابط الموقع أولاً.",
+        "err_invalid": "الرابط غير صالح. مثال صحيح: example.com",
+        "err_private": "لا يمكن فحص العناوين الداخلية أو الخاصة.",
+        "err_port": "يُسمح بالمنفذين 80 و443 فقط.",
+        "err_limit_client": "وصلت للحد الأقصى من الفحوصات في الساعة. حاول بعد {m} دقيقة تقريباً.",
+        "err_limit_host": "فُحص هذا الموقع مرات كثيرة مؤخراً. حاول بعد {m} دقيقة تقريباً.",
+        "err_limit_global": "الخدمة مشغولة حالياً. حاول بعد {m} دقيقة تقريباً.",
+        "remaining": "المتبقي لك هذه الساعة: {n} فحوصات",
+        "sec_findings": "الملاحظات",
+        "sec_passed": "النقاط الآمنة",
+        "none_findings": "لم نجد ملاحظات في الفحوصات الأساسية.",
+        "none_passed": "لم تنجح أي فحوصات في هذه المرة.",
+        "safe": "سليم",
+        "note": "فحص أساسي وسلبي لا يغني عن اختبار اختراق شامل.",
+        "download": "تنزيل التقرير (JSON)",
+        "summary": summary_ar,
+        "sev": {"high": "عالية", "medium": "متوسطة", "low": "منخفضة", "info": "معلومة"},
+        "grade": {"excellent": "ممتاز", "good": "جيد", "improve": "يحتاج تحسين", "weak": "ضعيف"},
+    },
+    "en": {
+        "dir": "ltr", "end": "left",
+        "title": "Website Security Scanner",
+        "subtitle": "Paste your site's URL and get a report of vulnerabilities and passed checks in seconds.",
+        "url_label": "Website URL",
+        "consent": "I own this website or have written permission to scan it",
+        "scan": "Scan website",
+        "spinner": "Scanning…",
+        "cooldown": "Please wait a few seconds before the next scan.",
+        "unreachable": "Couldn't reach the website. Check the URL and try again. ({err})",
+        "err_empty": "Enter a website URL first.",
+        "err_invalid": "Invalid URL. Example: example.com",
+        "err_private": "Internal or private addresses can't be scanned.",
+        "err_port": "Only ports 80 and 443 are allowed.",
+        "err_limit_client": "You've reached the hourly scan limit. Try again in about {m} minute(s).",
+        "err_limit_host": "This website was scanned too many times recently. Try again in about {m} minute(s).",
+        "err_limit_global": "The service is busy right now. Try again in about {m} minute(s).",
+        "remaining": "Scans left for you this hour: {n}",
+        "sec_findings": "Findings",
+        "sec_passed": "Passed checks",
+        "none_findings": "No findings in the basic checks.",
+        "none_passed": "No checks passed this time.",
+        "safe": "Passed",
+        "note": "A basic, passive scan. It doesn't replace a full penetration test.",
+        "download": "Download report (JSON)",
+        "summary": summary_en,
+        "sev": {"high": "High", "medium": "Medium", "low": "Low", "info": "Info"},
+        "grade": {"excellent": "Excellent", "good": "Good", "improve": "Needs work", "weak": "Weak"},
+    },
+}
+
+
+def text_of(item, lang):
+    """Render (title, detail, fix) of a stored finding/passed item in the given language."""
+    t, d, f = MSG[item["id"]][lang]
+    p = item.get("p", {})
+    return t.format(**p), d.format(**p), f.format(**p)
+
+
+# ------------------------------------------------------------------ Rate limiting
+class RateLimiter:
+    """Sliding-window limits: per client, per target host, and global. Shared across sessions."""
+
+    def __init__(self, per_client, per_host, global_limit, window=LIMIT_WINDOW):
+        self.per_client, self.per_host, self.global_limit, self.window = per_client, per_host, global_limit, window
+        self.hits = {}
+        self.lock = threading.Lock()
+
+    def _recent(self, key, now):
+        lst = [t for t in self.hits.get(key, []) if now - t < self.window]
+        if lst:
+            self.hits[key] = lst
+        else:
+            self.hits.pop(key, None)
+        return lst
+
+    def check_and_record(self, client, host, now=None):
+        """Returns (None, remaining_for_client) if allowed, else (kind, minutes_to_wait)."""
+        now = time.time() if now is None else now
+        keys = (("client", "c:" + client, self.per_client),
+                ("host", "h:" + host, self.per_host),
+                ("global", "g", self.global_limit))
+        with self.lock:
+            for kind, key, limit in keys:
+                lst = self._recent(key, now)
+                if len(lst) >= limit:
+                    return kind, int((lst[0] + self.window - now) // 60) + 1
+            for _, key, _ in keys:
+                self.hits.setdefault(key, []).append(now)
+            return None, self.per_client - len(self.hits["c:" + client])
+
+
+@st.cache_resource
+def get_limiter():
+    return RateLimiter(PER_CLIENT_LIMIT, PER_HOST_LIMIT, GLOBAL_LIMIT)
+
+
+def client_id():
+    """Best-effort client key: forwarded IP when behind a proxy, else a per-session id."""
+    try:
+        h = st.context.headers
+        ip = (h.get("X-Forwarded-For", "").split(",")[0].strip() or h.get("X-Real-Ip", "")).strip()
+        if ip:
+            return ip
+    except Exception:
+        pass
+    return st.session_state.setdefault("_sid", uuid.uuid4().hex)
+
+
+# ------------------------------------------------------------------ SSRF protection
+def assert_public(host):
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise requests.ConnectionError("DNS lookup failed")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise BlockedError("private")
+
+
+def safe_get(url, headers=None, stream=True, verify=True):
+    """GET that validates every redirect hop so the scanner can't reach internal networks."""
+    hdrs = {**UA, **(headers or {})}
+    for _ in range(MAX_REDIRECTS + 1):
+        p = urlparse(url)
+        try:
+            port = p.port
+        except ValueError:
+            raise BlockedError("port")
+        if p.scheme not in ("http", "https") or not p.hostname or port not in ALLOWED_PORTS:
+            raise BlockedError("port")
+        assert_public(p.hostname)
+        r = requests.get(url, headers=hdrs, timeout=TIMEOUT, allow_redirects=False,
+                         stream=stream, verify=verify)
+        loc = r.headers.get("Location")
+        if r.is_redirect and loc:
+            r.close()
+            url = urljoin(url, loc)
+            continue
+        return r
+    raise requests.TooManyRedirects("Too many redirects")
+
+
+def read_text(r):
+    data = b""
+    for chunk in r.iter_content(65536):
+        data += chunk
+        if len(data) >= MAX_BODY:
+            break
+    r.close()
+    return data.decode(r.encoding or "utf-8", errors="ignore")
+
+
+def normalize(raw):
+    """Returns a clean URL or raises ValueError('empty' | 'invalid')."""
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("empty")
+    if not re.match(r"^https?://", raw, re.I):
+        raw = "https://" + raw
+    try:
+        p = urlparse(raw)
+        host = p.hostname
+        p.port
+    except ValueError:
+        raise ValueError("invalid")
+    if not host or "." not in host or p.username:
+        raise ValueError("invalid")
+    return raw.rstrip("/")
+
+
+# ------------------------------------------------------------------ Checks
+def check_tls(host, rep):
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, 443), timeout=TIMEOUT) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                cert, ver = ss.getpeercert(), ss.version()
+    except ssl.SSLCertVerificationError as e:
+        rep.add("high", "tls_invalid", raw=str(e)[:160])
+        return
+    except Exception as e:
+        rep.add("info", "tls_check_failed", raw=str(e)[:160])
+        return
+    exp = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+    days = (exp - datetime.now(timezone.utc)).days
+    if days < 0:
+        rep.add("high", "cert_expired", days=-days)
+    elif days < 15:
+        rep.add("medium", "cert_expiring", days=days)
+    else:
+        rep.ok("ok_cert", days=days)
+    if ver not in ("TLSv1.2", "TLSv1.3"):
+        rep.add("high", "tls_old", raw=ver)
+    else:
+        rep.ok("ok_tls", raw=ver)
+
+
+def check_https_redirect(host, get, rep):
+    try:
+        r = get(f"http://{host}")
+        final = r.url
+        r.close()
+    except (requests.RequestException, BlockedError):
+        return
+    if final.startswith("https://"):
+        rep.ok("ok_redirect")
+    else:
+        rep.add("high", "no_https_redirect", raw=final)
+
+
+HEADERS = {
+    "Strict-Transport-Security": ("medium", "hsts"),
+    "Content-Security-Policy": ("medium", "csp"),
+    "X-Content-Type-Options": ("low", "xcto"),
+    "Referrer-Policy": ("low", "refpol"),
+    "Permissions-Policy": ("low", "perm"),
+}
+
+
+def check_headers(resp, rep):
+    h = resp.headers
+    present = []
+    for name, (sev, code) in HEADERS.items():
+        if name in h:
+            present.append(name)
+        else:
+            rep.add(sev, "hdr_missing_" + code)
+    if present:
+        rep.ok("ok_headers", n=len(present), total=len(HEADERS), raw=", ".join(present))
+    if "X-Frame-Options" in h or "frame-ancestors" in h.get("Content-Security-Policy", ""):
+        rep.ok("ok_clickjack")
+    else:
+        rep.add("medium", "no_clickjack")
+    leaks = [n for n in ("Server", "X-Powered-By", "X-AspNet-Version") if n in h and re.search(r"\d", h[n])]
+    for n in leaks:
+        rep.add("low", "version_leak", name=n, raw=h[n])
+    if not leaks:
+        rep.ok("ok_noleak")
+
+
+def check_cookies(cookies, rep):
+    if not cookies:
+        return
+    bad = 0
+    for c in cookies:
+        name, low = c.split("=", 1)[0], c.lower()
+        missing = [f for f, k in (("Secure", "secure"), ("HttpOnly", "httponly"), ("SameSite", "samesite"))
+                   if k not in low]
+        if missing:
+            bad += 1
+            rep.add("medium", "cookie_flags", name=name, missing=", ".join(missing))
+    if bad == 0:
+        rep.ok("ok_cookies", n=len(cookies))
+
+
+def check_cors(url, get, rep):
+    try:
+        r = get(url, headers={"Origin": "https://evil.example"})
+        acao = r.headers.get("Access-Control-Allow-Origin", "")
+        creds = r.headers.get("Access-Control-Allow-Credentials", "").lower() == "true"
+        r.close()
+    except (requests.RequestException, BlockedError):
+        return
+    if acao == "https://evil.example" and creds:
+        rep.add("high", "cors_reflect", raw=acao)
+    elif acao == "*":
+        rep.add("low", "cors_wild")
+    else:
+        rep.ok("ok_cors")
+
+
+def check_content(final_url, body, rep):
+    if final_url.startswith("https://"):
+        if re.search(r'(?:src|action)=["\']http://', body, re.I):
+            rep.add("medium", "mixed")
+        else:
+            rep.ok("ok_mixed")
+    elif 'type="password"' in body.lower():
+        rep.add("high", "pw_http")
+
+
+SENSITIVE = {
+    "/.git/HEAD": (lambda b: b.startswith(b"ref:"), "high"),
+    "/.env": (lambda b: re.search(rb"^[A-Z0-9_]+=", b, re.M) is not None, "high"),
+    "/phpinfo.php": (lambda b: b"phpinfo" in b.lower(), "medium"),
+    "/server-status": (lambda b: b"Apache Server Status" in b, "medium"),
+    "/.DS_Store": (lambda b: b.startswith(b"\x00\x00\x00\x01Bud1"), "low"),
+}
+
+
+def check_sensitive_files(base, get, rep):
+    found = False
+    for path, (validator, sev) in SENSITIVE.items():
+        try:
+            r = get(base + path)
+            chunk = next(r.iter_content(2048), b"") if r.status_code == 200 else b""
+            r.close()
+            if chunk and validator(chunk):
+                found = True
+                rep.add(sev, "sensitive_file", path=path, url=base + path)
+        except (requests.RequestException, BlockedError):
+            continue
+    if not found:
+        rep.ok("ok_files")
+
+
+def run_scan(url):
+    """Language-neutral scan: stores message ids + params so the report can be shown in any language."""
+    rep = Report()
+    verify = True
+    try:
+        resp = safe_get(url)
+    except requests.exceptions.SSLError as e:
+        rep.add("high", "ssl_verify_failed", raw=str(e)[:160])
+        verify = False
+        resp = safe_get(url, verify=False)
+    get = functools.partial(safe_get, verify=verify)
+
+    final_url = resp.url
+    host = urlparse(final_url).hostname
+    base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
+    try:
+        cookies = resp.raw.headers.getlist("Set-Cookie")
+    except Exception:
+        cookies = []
+    check_headers(resp, rep)
+    body = read_text(resp)
+
+    if final_url.startswith("https://"):
+        if verify:
+            check_tls(host, rep)
+        check_https_redirect(host, get, rep)
+    check_cookies(cookies, rep)
+    check_cors(final_url, get, rep)
+    check_content(final_url, body, rep)
+    check_sensitive_files(base, get, rep)
+
+    rep.findings.sort(key=lambda f: ORDER[f["severity"]])
+    return {"url": url, "final_url": final_url, "findings": rep.findings, "passed": rep.passed,
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+# ------------------------------------------------------------------ Rendering
+def calc_score(findings):
+    return max(0, 100 - sum(WEIGHT[f["severity"]] for f in findings))
+
+
+def grade(score):
+    if score >= 90:
+        return "excellent", "#1E8E5A"
+    if score >= 70:
+        return "good", "#5B9A2E"
+    if score >= 50:
+        return "improve", "#D98A12"
+    return "weak", "#C93B3B"
+
+
+CSS = """<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;600;700&display=swap');
+.stApp, .stApp p, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp button, .stApp input, .rp, .rp * {
+  font-family: 'IBM Plex Sans Arabic', 'Segoe UI', Tahoma, sans-serif;
+}
+.stApp { direction: __DIR__; }
+#MainMenu, footer { visibility: hidden; }
+.block-container { max-width: 640px; padding: 1.6rem 1rem 3rem; }
+.stTextInput input { direction: ltr; text-align: left; font-size: 1rem; }
+.stButton > button, .stDownloadButton > button { width: 100%; min-height: 3rem; font-weight: 600; }
+.hero h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 .35rem; line-height: 1.3; }
+.hero p { margin: 0 0 1.2rem; opacity: .75; line-height: 1.7; }
+.rp { margin-top: 1.4rem; }
+.verdict { display: flex; align-items: center; gap: 1.1rem; margin-bottom: 1.1rem; }
+.score { position: relative; width: 116px; height: 116px; flex: none; }
+.score::before { content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(var(--c) calc(var(--p) * 1%), rgba(128,128,128,.25) 0);
+  -webkit-mask: radial-gradient(farthest-side, transparent 70%, #000 71%);
+  mask: radial-gradient(farthest-side, transparent 70%, #000 71%); }
+.score span { position: absolute; inset: 0; display: grid; place-items: center; font-size: 2.1rem; font-weight: 700; }
+.vt h2 { margin: 0; font-size: 1.35rem; font-weight: 700; color: var(--c); }
+.vt p { margin: .2rem 0 0; opacity: .8; font-size: .92rem; line-height: 1.6; }
+.vt .h { direction: ltr; unicode-bidi: embed; word-break: break-all; text-align: __END__; }
+.chips { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 1rem; }
+.chip { border-radius: 6px; padding: 8px 2px; text-align: center; color: #14262A; }
+.chip b { display: block; font-size: 1.3rem; line-height: 1.2; }
+.chip span { font-size: .74rem; }
+.sec { font-size: 1.05rem; font-weight: 700; margin: 1.3rem 0 .6rem; }
+.sec small { font-weight: 400; opacity: .65; font-size: .85rem; margin-inline-start: .35rem; }
+.f { background: var(--t); border-inline-start: 5px solid var(--c); border-radius: 6px;
+  padding: 11px 14px 12px; margin: 0 0 10px; color: #14262A; }
+.f .tag { display: inline-block; background: var(--c); color: #fff; font-size: .72rem; font-weight: 600;
+  padding: 1px 9px; border-radius: 99px; }
+.f h3 { margin: 6px 0 2px; font-size: 1rem; font-weight: 600; line-height: 1.5; color: #14262A; }
+.f .d { margin: 3px 0; font-size: .82rem; color: #4A5A5E; word-break: break-word; }
+.f .d.raw { direction: ltr; text-align: __END__; word-break: break-all; }
+.f .fix { margin: 6px 0 0; font-size: .9rem; line-height: 1.6; }
+.empty { font-size: .92rem; opacity: .75; margin: 0 0 10px; }
+.note { font-size: .78rem; opacity: .65; text-align: center; margin-top: 1.4rem; line-height: 1.7; }
+</style>"""
+
+
+def build_css(lang):
+    ui = UI[lang]
+    return CSS.replace("__DIR__", ui["dir"]).replace("__END__", ui["end"])
+
+
+def _detail_html(text):
+    """Latin/technical details (URLs, header names) are shown LTR; translated sentences follow the page direction."""
+    if not text:
+        return ""
+    raw = ' raw' if re.match(r"^[\x00-\x7F]+$", text) else ""
+    return f'<p class="d{raw}">{escape(text)}</p>'
+
+
+def build_report_html(res, lang):
+    ui = UI[lang]
+    fs, ps = res["findings"], res.get("passed", [])
+    score = calc_score(fs)
+    gkey, color = grade(score)
+    counts = {s: sum(1 for f in fs if f["severity"] == s) for s in ORDER}
+    parts = [
+        f'<div class="rp" dir="{ui["dir"]}">',
+        f'<div class="verdict"><div class="score" style="--p:{score};--c:{color}"><span>{score}</span></div>',
+        f'<div class="vt" style="--c:{color}"><h2>{ui["grade"][gkey]}</h2><p>{ui["summary"](len(fs), len(ps))}</p>',
+        f'<p class="h">{escape(res["final_url"])}</p></div></div>',
+        '<div class="chips">',
+    ]
+    for s, n in counts.items():
+        parts.append(f'<div class="chip" style="background:{TINT[s]};border-top:4px solid {COLOR[s]}">'
+                     f'<b>{n}</b><span>{ui["sev"][s]}</span></div>')
+    parts.append(f'<div class="chip" style="background:{GREEN_TINT};border-top:4px solid {GREEN}">'
+                 f'<b>{len(ps)}</b><span>{ui["safe"]}</span></div></div>')
+
+    parts.append(f'<div class="sec">{ui["sec_findings"]}<small>{len(fs)}</small></div>')
+    if not fs:
+        parts.append(f'<p class="empty">{ui["none_findings"]}</p>')
+    for f in fs:
+        s = f["severity"]
+        title, detail, fix = text_of(f, lang)
+        fx = f'<p class="fix">💡 {escape(fix)}</p>' if fix else ""
+        parts.append(f'<div class="f" style="--c:{COLOR[s]};--t:{TINT[s]}">'
+                     f'<span class="tag">{ui["sev"][s]}</span><h3>{escape(title)}</h3>{_detail_html(detail)}{fx}</div>')
+
+    parts.append(f'<div class="sec">{ui["sec_passed"]}<small>{len(ps)}</small></div>')
+    if not ps:
+        parts.append(f'<p class="empty">{ui["none_passed"]}</p>')
+    for p in ps:
+        title, detail, _ = text_of(p, lang)
+        parts.append(f'<div class="f" style="--c:{GREEN};--t:{GREEN_TINT}">'
+                     f'<span class="tag">{ui["safe"]}</span><h3>✅ {escape(title)}</h3>{_detail_html(detail)}</div>')
+
+    parts.append(f'<p class="note">{ui["note"]}<br>{escape(res["at"])}</p></div>')
+    return "".join(parts)
+
+
+def export_report(res, lang):
+    """JSON export in the language currently selected."""
+    def row(item, with_sev):
+        title, detail, fix = text_of(item, lang)
+        d = {"id": item["id"], "title": title, "detail": detail}
+        if with_sev:
+            d = {"severity": item["severity"], **d, "fix": fix}
+        return d
+
+    return {
+        "url": res["final_url"], "scanned_at": res["at"], "language": lang,
+        "score": calc_score(res["findings"]),
+        "findings": [row(f, True) for f in res["findings"]],
+        "passed": [row(p, False) for p in res.get("passed", [])],
+    }
+
+
+# ------------------------------------------------------------------ App
+def main():
+    st.set_page_config(page_title="Website Security Scanner | فاحص أمان المواقع", page_icon="🛡️",
+                       layout="centered")
+    choice = st.selectbox("🌐 Language / اللغة", list(LANGS), key="lang_choice")
+    lang = LANGS[choice]
+    ui = UI[lang]
+
+    st.markdown(build_css(lang), unsafe_allow_html=True)
+    st.markdown(f'<div class="hero" dir="{ui["dir"]}"><h1>{ui["title"]}</h1><p>{ui["subtitle"]}</p></div>',
+                unsafe_allow_html=True)
+
+    raw = st.text_input(ui["url_label"], placeholder="example.com")
+    ok = st.checkbox(ui["consent"])
+    go = st.button(ui["scan"], type="primary", disabled=not ok)
+
+    if go:
+        last = st.session_state.get("last_scan", 0)
+        if time.time() - last < COOLDOWN_SECONDS:
+            st.warning(ui["cooldown"])
+        else:
+            try:
+                url = normalize(raw)
+                blocked, val = get_limiter().check_and_record(client_id(), urlparse(url).hostname.lower())
+                if blocked:
+                    st.error(ui["err_limit_" + blocked].format(m=val))
+                else:
+                    st.session_state["last_scan"] = time.time()
+                    st.session_state["remaining"] = val
+                    with st.spinner(ui["spinner"]):
+                        st.session_state["result"] = run_scan(url)
+            except ValueError as e:
+                st.error(ui.get("err_" + str(e), ui["err_invalid"]))
+            except BlockedError as e:
+                st.error(ui.get("err_" + str(e), ui["err_private"]))
+            except requests.RequestException as e:
+                st.error(ui["unreachable"].format(err=type(e).__name__))
+
+    res = st.session_state.get("result")
+    if res:
+        st.markdown(build_report_html(res, lang), unsafe_allow_html=True)
+        st.caption(ui["remaining"].format(n=st.session_state.get("remaining", PER_CLIENT_LIMIT)))
+        st.download_button(ui["download"],
+                           data=json.dumps(export_report(res, lang), ensure_ascii=False, indent=2),
+                           file_name="security-report.json", mime="application/json")
+
+
+if __name__ == "__main__":
+    main()
